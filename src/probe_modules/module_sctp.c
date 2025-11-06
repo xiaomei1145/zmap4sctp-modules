@@ -28,9 +28,11 @@
 
 // 数据包长度
 #define SCTP_HEADER_LEN 12
-#define SCTP_INIT_CHUNK_LEN 20
+#define SCTP_INIT_CHUNK_LEN 16  // Initiate tag(4) + a_rwnd(4) + streams(2+2) + TSN(4) = 16
+#define SCTP_INIT_PARAMS_LEN 16  // 8 (addr_types) + 4 (ecn) + 4 (forward_tsn)
 #define SCTP_PACKET_LEN (sizeof(struct ether_header) + sizeof(struct ip) + \
-                         SCTP_HEADER_LEN + SCTP_INIT_CHUNK_LEN)
+                         SCTP_HEADER_LEN + sizeof(struct sctp_chunk_header) + \
+                         SCTP_INIT_CHUNK_LEN + SCTP_INIT_PARAMS_LEN)
 
 // 通用头
 struct sctp_header {
@@ -46,13 +48,39 @@ struct sctp_chunk_header {
 	uint16_t length;
 } __attribute__((packed));
 
-// SCTP INIT Chunk（不含 chunk 头）
+// SCTP INIT Chunk
 struct sctp_init_chunk {
 	uint32_t initiate_tag;
 	uint32_t a_rwnd;
 	uint16_t num_outbound_streams;
 	uint16_t num_inbound_streams;
 	uint32_t initial_tsn;
+} __attribute__((packed));
+
+// SCTP 参数头
+struct sctp_param_header {
+	uint16_t type;
+	uint16_t length;
+} __attribute__((packed));
+
+// Supported Address Types 参数
+struct sctp_param_supported_addr_types {
+	struct sctp_param_header header;  // type=0x000c
+	uint16_t addr_type_1;             // 0x0005 = IPv4
+	uint16_t padding;                 // 对齐到 4 字节
+} __attribute__((packed));
+
+// ECN, Forward TSN
+struct sctp_param_simple {
+	struct sctp_param_header header;
+} __attribute__((packed));
+
+// 完整的 INIT 包含可选参数
+struct sctp_init_with_params {
+	struct sctp_init_chunk init;
+	struct sctp_param_supported_addr_types addr_types;
+	struct sctp_param_simple ecn;
+	struct sctp_param_simple forward_tsn;
 } __attribute__((packed));
 
 // CRC32c 查找表
@@ -117,8 +145,11 @@ static int sctp_prepare_packet(void *buf, macaddr_t *src_mac,
 	struct ip *ip_header = (struct ip *)(&eth_header[1]);
 	uint16_t ip_len = htons(sizeof(struct ip) + SCTP_HEADER_LEN + 
 	                        sizeof(struct sctp_chunk_header) + 
-	                        sizeof(struct sctp_init_chunk));
+	                        SCTP_INIT_CHUNK_LEN + SCTP_INIT_PARAMS_LEN);
 	make_ip_header(ip_header, IPPROTO_SCTP, ip_len);
+
+	ip_header->ip_tos = 0x02;
+	ip_header->ip_off = htons(0x4000);
 	
 	struct sctp_header *sctp_header = (struct sctp_header *)(&ip_header[1]);
 	memset(sctp_header, 0, SCTP_HEADER_LEN);
@@ -127,17 +158,30 @@ static int sctp_prepare_packet(void *buf, macaddr_t *src_mac,
 		(struct sctp_chunk_header *)(&sctp_header[1]);
 	chunk_header->type = SCTP_CHUNK_INIT;
 	chunk_header->flags = 0;
-	chunk_header->length = htons(sizeof(struct sctp_chunk_header) + 
-	                             sizeof(struct sctp_init_chunk));
+	chunk_header->length = htons(36);
 	
-	struct sctp_init_chunk *init_chunk = 
-		(struct sctp_init_chunk *)(&chunk_header[1]);
+	struct sctp_init_with_params *init_data = 
+		(struct sctp_init_with_params *)(&chunk_header[1]);
 	
-	// 默认值
-	init_chunk->a_rwnd = htonl(106496);
-	init_chunk->num_outbound_streams = htons(10);
-	init_chunk->num_inbound_streams = htons(65535);
-	init_chunk->initial_tsn = htonl(0);
+	// 填充 INIT chunk 基本字段
+	init_data->init.a_rwnd = htonl(106496);
+	init_data->init.num_outbound_streams = htons(10);
+	init_data->init.num_inbound_streams = htons(65535);
+	init_data->init.initial_tsn = htonl(0);
+	
+	// Supported Address Types
+	init_data->addr_types.header.type = htons(0x000c);
+	init_data->addr_types.header.length = htons(6);  // 4 (header) + 2 (IPv4 type)，padding 不算
+	init_data->addr_types.addr_type_1 = htons(0x0005);  // IPv4
+	init_data->addr_types.padding = 0;
+	
+	// ECN
+	init_data->ecn.header.type = htons(0x8000);
+	init_data->ecn.header.length = htons(4);  // 仅 header
+	
+	// Forward TSN
+	init_data->forward_tsn.header.type = htons(0xc000);
+	init_data->forward_tsn.header.length = htons(4);  // 仅 header
 	
 	return EXIT_SUCCESS;
 }
@@ -155,8 +199,8 @@ static int sctp_make_packet(void *buf, size_t *buf_len,
 	struct sctp_header *sctp_header = (struct sctp_header *)(&ip_header[1]);
 	struct sctp_chunk_header *chunk_header = 
 		(struct sctp_chunk_header *)(&sctp_header[1]);
-	struct sctp_init_chunk *init_chunk = 
-		(struct sctp_init_chunk *)(&chunk_header[1]);
+	struct sctp_init_with_params *init_data = 
+		(struct sctp_init_with_params *)(&chunk_header[1]);
 
 	ip_header->ip_src.s_addr = src_ip;
 	ip_header->ip_dst.s_addr = dst_ip;
@@ -169,13 +213,17 @@ static int sctp_make_packet(void *buf, size_t *buf_len,
 	sctp_header->verification_tag = 0;
 	sctp_header->checksum = 0;
 	
-	init_chunk->initiate_tag = validation[0];
-	init_chunk->initial_tsn = validation[1];
+	init_data->init.initiate_tag = htonl(validation[0]);
+	init_data->init.initial_tsn = htonl(validation[1]);
 	
+	// 计算 CRC32c
 	size_t sctp_len = SCTP_HEADER_LEN + sizeof(struct sctp_chunk_header) + 
-	                  sizeof(struct sctp_init_chunk);
+	                  SCTP_INIT_CHUNK_LEN + SCTP_INIT_PARAMS_LEN;
 	uint32_t crc = calculate_crc32c((uint8_t *)sctp_header, sctp_len);
-	sctp_header->checksum = htonl(crc);
+
+    // RFC 4960: SCTP checksum is in Little-Endian
+    // what can i say
+	sctp_header->checksum = crc;
 
 	ip_header->ip_sum = 0;
 	ip_header->ip_sum = zmap_ip_checksum((unsigned short *)ip_header);
