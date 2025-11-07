@@ -223,7 +223,7 @@ static int sctp_make_packet(void *buf, size_t *buf_len,
 
     // RFC 4960: SCTP checksum is in Little-Endian
     // what can i say
-	sctp_header->checksum = crc;
+    sctp_header->checksum = htole32(crc);
 
 	ip_header->ip_sum = 0;
 	ip_header->ip_sum = zmap_ip_checksum((unsigned short *)ip_header);
@@ -395,7 +395,7 @@ static fielddef_t fields[] = {
 probe_module_t module_sctp = {
 	.name = "sctp",
 	.max_packet_length = SCTP_PACKET_LEN,
-	.pcap_filter = "sctp || ip proto 132",
+	.pcap_filter = "(ip proto 132) || icmp",
 	.pcap_snaplen = 256,
 	.port_args = 1,
 	
