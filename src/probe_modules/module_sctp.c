@@ -1,6 +1,6 @@
 /* 
- * SCTP 扫描这块
-*/
+ * SCTP扫描这块
+ */
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -13,18 +13,9 @@
 #include "../../lib/logger.h"
 #include "../fieldset.h"
 #include "probe_modules.h"
+#include "module_sctp.h"
 #include "packet.h"
 #include "validate.h"
-
-// SCTP 协议号
-#ifndef IPPROTO_SCTP
-#define IPPROTO_SCTP 132
-#endif
-
-// Chunk 类型
-#define SCTP_CHUNK_INIT     1
-#define SCTP_CHUNK_INIT_ACK 2
-#define SCTP_CHUNK_ABORT    6
 
 // 数据包长度
 #define SCTP_HEADER_LEN 12
@@ -33,55 +24,6 @@
 #define SCTP_PACKET_LEN (sizeof(struct ether_header) + sizeof(struct ip) + \
                          SCTP_HEADER_LEN + sizeof(struct sctp_chunk_header) + \
                          SCTP_INIT_CHUNK_LEN + SCTP_INIT_PARAMS_LEN)
-
-// 通用头
-struct sctp_header {
-	uint16_t src_port;
-	uint16_t dst_port;
-	uint32_t verification_tag;
-	uint32_t checksum;
-} __attribute__((packed));
-
-struct sctp_chunk_header {
-	uint8_t type;
-	uint8_t flags;
-	uint16_t length;
-} __attribute__((packed));
-
-// SCTP INIT Chunk
-struct sctp_init_chunk {
-	uint32_t initiate_tag;
-	uint32_t a_rwnd;
-	uint16_t num_outbound_streams;
-	uint16_t num_inbound_streams;
-	uint32_t initial_tsn;
-} __attribute__((packed));
-
-// SCTP 参数头
-struct sctp_param_header {
-	uint16_t type;
-	uint16_t length;
-} __attribute__((packed));
-
-// Supported Address Types 参数
-struct sctp_param_supported_addr_types {
-	struct sctp_param_header header;  // type=0x000c
-	uint16_t addr_type_1;             // 0x0005 = IPv4
-	uint16_t padding;                 // 对齐到 4 字节
-} __attribute__((packed));
-
-// ECN, Forward TSN
-struct sctp_param_simple {
-	struct sctp_param_header header;
-} __attribute__((packed));
-
-// 完整的 INIT 包含可选参数
-struct sctp_init_with_params {
-	struct sctp_init_chunk init;
-	struct sctp_param_supported_addr_types addr_types;
-	struct sctp_param_simple ecn;
-	struct sctp_param_simple forward_tsn;
-} __attribute__((packed));
 
 // CRC32c 查找表
 static uint32_t crc32c_table[256];
@@ -317,13 +259,14 @@ static void sctp_process_packet(const u_char *packet, uint32_t len,
 	struct sctp_header *sctp = (struct sctp_header *)((char *)ip_hdr + 
 	                                                   ip_hdr->ip_hl * 4);
 	struct sctp_chunk_header *chunk = (struct sctp_chunk_header *)(&sctp[1]);
-	
+
 	fs_add_uint64(fs, "sport", (uint64_t)ntohs(sctp->src_port));
 	fs_add_uint64(fs, "dport", (uint64_t)ntohs(sctp->dst_port));
 	fs_add_uint64(fs, "verification_tag", (uint64_t)ntohl(sctp->verification_tag));
+	fs_add_uint64(fs, "chunk_type", (uint64_t)chunk->type);
 
 	if (chunk->type == SCTP_CHUNK_INIT_ACK) {
-		fs_add_string(fs, "classification", (char *)"init-ack", 0);
+		fs_add_constchar(fs, "classification", "init-ack");
 		fs_add_bool(fs, "success", 1);
 
 		size_t chunk_data_len = ntohs(chunk->length) - 
@@ -342,18 +285,32 @@ static void sctp_process_packet(const u_char *packet, uint32_t len,
 			             (uint64_t)ntohs(init_ack->num_inbound_streams));
 			fs_add_uint64(fs, "initial_tsn", 
 			             (uint64_t)ntohl(init_ack->initial_tsn));
+		} else {
+			fs_add_null(fs, "initiate_tag");
+			fs_add_null(fs, "a_rwnd");
+			fs_add_null(fs, "num_outbound_streams");
+			fs_add_null(fs, "num_inbound_streams");
+			fs_add_null(fs, "initial_tsn");
 		}
 		
 	} else if (chunk->type == SCTP_CHUNK_ABORT) {
-		fs_add_string(fs, "classification", (char *)"abort", 0);
+		fs_add_constchar(fs, "classification", "abort");
 		fs_add_bool(fs, "success", 0);
+		fs_add_null(fs, "initiate_tag");
+		fs_add_null(fs, "a_rwnd");
+		fs_add_null(fs, "num_outbound_streams");
+		fs_add_null(fs, "num_inbound_streams");
+		fs_add_null(fs, "initial_tsn");
 		
 	} else {
-		fs_add_string(fs, "classification", (char *)"other", 0);
+		fs_add_constchar(fs, "classification", "other");
 		fs_add_bool(fs, "success", 0);
+		fs_add_null(fs, "initiate_tag");
+		fs_add_null(fs, "a_rwnd");
+		fs_add_null(fs, "num_outbound_streams");
+		fs_add_null(fs, "num_inbound_streams");
+		fs_add_null(fs, "initial_tsn");
 	}
-	
-	fs_add_uint64(fs, "chunk_type", (uint64_t)chunk->type);
 }
 
 static fielddef_t fields[] = {
@@ -395,7 +352,7 @@ static fielddef_t fields[] = {
 probe_module_t module_sctp = {
 	.name = "sctp",
 	.max_packet_length = SCTP_PACKET_LEN,
-	.pcap_filter = "(ip proto 132) || icmp",
+	.pcap_filter = "ip[9] = 132 || icmp",
 	.pcap_snaplen = 256,
 	.port_args = 1,
 	
